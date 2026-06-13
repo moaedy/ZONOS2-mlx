@@ -59,10 +59,9 @@ class MLXWorker:
             if kind == "full":
                 text, emb, temperature, seed, done = rest
                 try:
-                    frames, eos = self._tts.generate(
+                    audio, sr = self._tts.synthesize(
                         text, voice_emb=emb, temperature=temperature,
-                        seed=seed, verbose=False)   # max_tokens defaults to context budget
-                    audio, sr = X.decode_to_audio(frames, eos, device=self.dac_device)
+                        seed=seed, dac_device=self.dac_device)
                     done.result = None if audio is None else (sr, np.asarray(audio, np.float32))
                 except Exception as exc:        # surface to the UI thread
                     done.error = exc
@@ -70,10 +69,10 @@ class MLXWorker:
             elif kind == "stream":
                 text, emb, temperature, seed, out_q = rest
                 try:
-                    self._tts.generate_stream(
+                    self._tts.synthesize_stream(
                         text, on_chunk=lambda sr, d: out_q.put((sr, d)),
                         voice_emb=emb, temperature=temperature, seed=seed,
-                        dac_device=self.dac_device)   # max_tokens -> context budget
+                        dac_device=self.dac_device)
                 except Exception as exc:
                     out_q.put(exc)
                 out_q.put(None)        # sentinel: stream finished

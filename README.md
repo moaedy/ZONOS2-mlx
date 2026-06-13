@@ -156,9 +156,14 @@ MLX makes weight quantization a one-liner (`mx.quantize`) with fused low-bit ker
 
 Result: **~6 GB resident, ~100 frames/s, prefill logit cosine 0.9996 vs bf16** - no audible quality loss, and it fits a 16 GB Mac. `--quantize 8` is bit-for-bit lossless (cosine 1.000) at ~7.5 GB.
 
+## Long text
+
+A single pass is bounded by the model's context window: the text bytes **and** the generated audio share the same 6144-frame (~71 s) budget, so one utterance tops out around ~500 characters / ~30-60 s (this matches the reference, which caps `max_tokens` at `max_seq_len`). Text longer than that is **automatically split into sentence-grouped segments** and stitched (with a short silence between), so arbitrarily long input plays start-to-finish - in both the full and streaming paths. Short text stays a single pass for the most natural prosody.
+
 ## Limitations
 - **No text normalization yet.** The official model uses NeMo TN to verbalize numbers/dates; this port sends raw text bytes, so spell out numbers (`"twenty twenty six"`, not `"2026"`) for best results.
 - Single-sequence generation (no request batching).
+- Segment boundaries in very long text have a small silence seam (the model has no cross-segment prosody).
 - The speaker encoder loads a ~1.7 B model the first time you clone a new voice (then caches the embedding).
 
 ## Roadmap

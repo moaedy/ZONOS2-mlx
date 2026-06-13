@@ -22,6 +22,7 @@ import argparse
 import glob
 import math
 import os
+import re
 import time
 
 import mlx.core as mx
@@ -78,6 +79,37 @@ def shear_up_np(x, pad):
         if H > j:
             out[..., : H - j, j] = x[..., j:, j]
     return out
+
+
+# A single pass can't exceed the model context (~71 s): the text bytes AND the
+# audio frames share the 6144-frame budget, so ~500 chars is a safe per-segment
+# cap (text prompt + its ~30 s of audio fit comfortably). Longer input is split
+# into sentence-grouped segments and stitched. Short text stays one pass (best
+# prosody, no seam).
+_SENT_SPLIT = re.compile(r"(?<=[.!?؟。！？…])\s+|\n+")
+
+
+def split_text(text, max_chars=500):
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    chunks, cur = [], ""
+    for s in (p.strip() for p in _SENT_SPLIT.split(text) if p.strip()):
+        while len(s) > max_chars:                       # a single over-long sentence
+            cut = s.rfind(" ", 0, max_chars)
+            cut = cut if cut > 0 else max_chars
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(s[:cut].strip()); s = s[cut:].strip()
+        if not cur:
+            cur = s
+        elif len(cur) + 1 + len(s) <= max_chars:
+            cur += " " + s
+        else:
+            chunks.append(cur); cur = s
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def build_prompt(text, with_speaker, trailing_silence_bucket=3):
@@ -520,6 +552,39 @@ class Zonos2MLX:
                 flush(False)
         flush(True)
 
+    def synthesize(self, text, voice_emb=None, seed=42, gap_s=0.15, dac_device="mps",
+                   max_chars=500, **kw):
+        """Full clip for text of any length: one pass if it fits the context,
+        otherwise split into segments and concatenate (short silence between)."""
+        segs = split_text(text, max_chars) or [text]
+        if len(segs) == 1:
+            frames, eos = self.generate(segs[0], voice_emb=voice_emb, seed=seed,
+                                        verbose=False, **kw)
+            return decode_to_audio(frames, eos, device=dac_device)
+        gap = np.zeros(int(gap_s * 44100), dtype=np.float32)
+        pieces = []
+        for i, seg in enumerate(segs):
+            frames, eos = self.generate(seg, voice_emb=voice_emb, seed=seed + i,
+                                        verbose=False, **kw)
+            audio, _ = decode_to_audio(frames, eos, device=dac_device)
+            if audio is not None and len(audio):
+                if pieces:
+                    pieces.append(gap)
+                pieces.append(np.asarray(audio, np.float32))
+        return (np.concatenate(pieces), 44100) if pieces else (None, 44100)
+
+    def synthesize_stream(self, text, on_chunk, voice_emb=None, seed=42, gap_s=0.15,
+                          dac_device="mps", max_chars=500, **kw):
+        """Streaming version: stream each segment in turn so arbitrarily long
+        text plays start to finish."""
+        segs = split_text(text, max_chars) or [text]
+        gap = np.zeros(int(gap_s * 44100), dtype=np.float32)
+        for i, seg in enumerate(segs):
+            if i:
+                on_chunk(44100, gap)
+            self.generate_stream(seg, on_chunk, voice_emb=voice_emb, seed=seed + i,
+                                 dac_device=dac_device, **kw)
+
 
 # ---- Vocoder (PyTorch DAC) -------------------------------------------------
 _DAC = {}
@@ -574,9 +639,9 @@ def main():
     voice_emb = get_speaker_embedding(args.voice, args.speaker_device) if args.voice else None
     tts = Zonos2MLX(ckpt, dtype=dtype, quantize=quantize, q_group=args.q_group)
     print(f"[gen] text: {args.text!r}  voice: {args.voice or '(default)'}", flush=True)
-    frames, eos_frame = tts.generate(args.text, voice_emb=voice_emb, max_tokens=args.max_tokens,
-                                     temperature=args.temperature, seed=args.seed)
-    audio, sr = decode_to_audio(frames, eos_frame, device=args.dac_device)
+    audio, sr = tts.synthesize(args.text, voice_emb=voice_emb, temperature=args.temperature,
+                               seed=args.seed, max_tokens=args.max_tokens,
+                               dac_device=args.dac_device)
     if audio is None:
         print("No audio generated.")
         return
