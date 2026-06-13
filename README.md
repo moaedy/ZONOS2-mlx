@@ -93,7 +93,20 @@ pip install -r requirements.txt
 
 The ~15 GB `Zyphra/ZONOS2` checkpoint is downloaded automatically from Hugging Face on first run.
 
-## Usage
+## Demo
+
+The easiest way to try it - type text, pick a voice from the dropdown, press **Generate**, and it plays:
+
+```bash
+python app.py                  # web UI (needs `pip install gradio`)
+python app.py --quantize 4     # same, in ~6 GB
+
+python demo.py                 # terminal version, no extra deps (plays via afplay)
+```
+
+`app.py` opens a local Gradio page with a text box, a **voice dropdown** populated from `default_voices/`, temperature/seed controls, and an autoplaying audio player. The model loads once and stays resident, so every generation after the first is fast. `demo.py` is a zero-dependency terminal loop (`:voice` to switch voice, `:quit` to exit).
+
+## Usage (CLI)
 
 ```bash
 # Text-to-speech (default voice)

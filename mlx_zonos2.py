@@ -432,8 +432,18 @@ class Zonos2MLX:
 
 
 # ---- Vocoder (PyTorch DAC) -------------------------------------------------
+_DAC = {}
+
+
+def _get_dac(device):
+    if device not in _DAC:
+        import dac
+        _DAC[device] = dac.DAC.load(dac.utils.download(model_type="44khz")).eval().to(device)
+    return _DAC[device]
+
+
 def decode_to_audio(frames, eos_frame, device="mps"):
-    import torch, dac
+    import torch
     codes = shear_up_np(np.array(frames, dtype=np.int64), AUDIO_PAD_ID)
     if eos_frame is not None:
         codes = codes[: max(0, eos_frame)]
@@ -441,7 +451,7 @@ def decode_to_audio(frames, eos_frame, device="mps"):
         return None, 44100
     codes = np.clip(codes, None, CODEBOOK_SIZE - 1)
     codes = torch.from_numpy(codes).to(device).unsqueeze(0).permute(0, 2, 1)   # (1,9,F)
-    model = dac.DAC.load(dac.utils.download(model_type="44khz")).eval().to(device)
+    model = _get_dac(device)
     with torch.no_grad():
         z = model.quantizer.from_codes(codes)[0]
         audio = model.decode(z).float().squeeze(1).squeeze(0).cpu().numpy()

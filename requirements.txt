@@ -7,3 +7,4 @@ soundfile                       # WAV/MP3 I/O
 descript-audio-codec==1.0.0     # 44.1 kHz DAC vocoder
 transformers>=4.56              # voice-cloning speaker encoder (ECAPA-TDNN)
 huggingface_hub                 # checkpoint download
+gradio>=5                       # optional: web demo (app.py); demo.py needs no extra deps
