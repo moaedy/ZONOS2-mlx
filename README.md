@@ -104,7 +104,7 @@ python app.py --quantize 4     # same, in ~6 GB
 python demo.py                 # terminal version, no extra deps (plays via afplay)
 ```
 
-`app.py` opens a local Gradio page with a text box, a **voice dropdown** populated from `default_voices/`, temperature/seed controls, and two buttons:
+`app.py` opens a local Gradio page with a text box, a **voice dropdown** populated from `default_voices/`, a **🎙️ record/upload box** (record or drop in a clip to clone *your own* voice on the fly - it overrides the dropdown), temperature/seed controls, and two buttons:
 
 - **Generate** - returns the whole clip.
 - **Stream ▶** - plays the audio **as it is generated**. Because decode runs at ~real time, sound starts in about **1.4 s** and then keeps pace with playback. (Implemented by decoding the codebook frames incrementally as they come out of the autoregressive loop.)

@@ -118,18 +118,35 @@ class SpeakerEncoder:
         return out.reshape(-1)[:SPEAKER_EMB_DIM].contiguous()
 
 
-def get_speaker_embedding(voice_path, device="cpu"):
-    cache = voice_path + ".zonos2spk.npy"
-    if os.path.exists(cache):
-        return np.load(cache).astype(np.float32)
+_ENCODERS = {}
+
+
+def _get_encoder(device="cpu"):
+    """Cache the (heavy) speaker encoder so recording a new voice is fast."""
+    if device not in _ENCODERS:
+        _ENCODERS[device] = SpeakerEncoder(device=device)
+    return _ENCODERS[device]
+
+
+def embed_audio(voice_path, device="cpu", cache=True):
+    """2048-d speaker embedding for a reference clip (no path-side cache by default)."""
     import torch, soundfile as sf
+    npy = voice_path + ".zonos2spk.npy"
+    if cache and os.path.exists(npy):
+        return np.load(npy).astype(np.float32)
     wav_np, sr = sf.read(voice_path, dtype="float32", always_2d=True)
     print(f"[voice] encoding {voice_path} via Qwen3/ECAPA on {device} ...", flush=True)
-    enc = SpeakerEncoder(device=device)
-    emb = enc.embed(torch.from_numpy(wav_np.T), sr).cpu().numpy().astype(np.float32)
-    np.save(cache, emb)
-    del enc
+    emb = _get_encoder(device).embed(torch.from_numpy(wav_np.T), sr).cpu().numpy().astype(np.float32)
+    if cache:
+        try:
+            np.save(npy, emb)
+        except OSError:
+            pass
     return emb
+
+
+def get_speaker_embedding(voice_path, device="cpu"):
+    return embed_audio(voice_path, device=device, cache=True)
 
 
 # ---- MLX helpers -----------------------------------------------------------

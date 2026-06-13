@@ -119,25 +119,29 @@ def main():
     voices = discover_voices(args.voices_dir)
     print(f"Ready. Voices: {', '.join(voices)}", flush=True)
 
-    def _embedding(voice_name):
+    def _embedding(voice_name, ref_audio):
+        # A recorded/uploaded clip overrides the dropdown voice.
+        if ref_audio:
+            return X.embed_audio(ref_audio, args.speaker_device, cache=False)
         path = voices.get(voice_name)
         return X.get_speaker_embedding(path, args.speaker_device) if path else None
 
-    def synth(text, voice_name, temperature, seed):
+    def synth(text, voice_name, ref_audio, temperature, seed):
         text = (text or "").strip()
         if not text:
             raise gr.Error("Please enter some text.")
-        result = worker.generate(text, _embedding(voice_name), float(temperature), int(seed))
+        result = worker.generate(text, _embedding(voice_name, ref_audio),
+                                 float(temperature), int(seed))
         if result is None:
             raise gr.Error("No audio was generated; try different text.")
         return result
 
-    def synth_stream(text, voice_name, temperature, seed):
+    def synth_stream(text, voice_name, ref_audio, temperature, seed):
         """Generator: plays audio while it is still being generated."""
         text = (text or "").strip()
         if not text:
             raise gr.Error("Please enter some text.")
-        emb = _embedding(voice_name)
+        emb = _embedding(voice_name, ref_audio)
         for sr, delta in worker.generate_stream(text, emb, float(temperature), int(seed)):
             yield (sr, (np.clip(delta, -1.0, 1.0) * 32767).astype(np.int16))
 
@@ -155,8 +159,12 @@ def main():
             with gr.Column(scale=2):
                 voice = gr.Dropdown(
                     choices=list(voices), value=list(voices)[0], label="Voice")
+                ref_audio = gr.Audio(
+                    sources=["microphone", "upload"], type="filepath",
+                    label="🎙️ Record or upload a reference voice (overrides the dropdown)")
                 temperature = gr.Slider(0.5, 1.5, value=1.15, step=0.05, label="Temperature")
                 seed = gr.Number(value=42, label="Seed", precision=0)
+        inputs = [text, voice, ref_audio, temperature, seed]
         with gr.Row():
             btn = gr.Button("Generate", variant="primary")
             stream_btn = gr.Button("Stream ▶  (play while generating)")
@@ -164,9 +172,9 @@ def main():
         stream_out = gr.Audio(
             label="Streaming output (starts playing within ~1 s)",
             streaming=True, autoplay=True)
-        btn.click(synth, [text, voice, temperature, seed], out)
-        text.submit(synth, [text, voice, temperature, seed], out)
-        stream_btn.click(synth_stream, [text, voice, temperature, seed], stream_out)
+        btn.click(synth, inputs, out)
+        text.submit(synth, inputs, out)
+        stream_btn.click(synth_stream, inputs, stream_out)
         gr.Markdown(
             "_**Generate** returns the whole clip; **Stream** plays it as it is produced "
             "(the model runs at ~real time, so audio starts almost immediately). "
