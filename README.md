@@ -101,6 +101,8 @@ The easiest way to try it - type text, pick a voice from the dropdown, press **G
 python app.py                  # web UI (needs `pip install gradio`)
 python app.py --quantize 4     # same, in ~6 GB
 
+./serve.sh                     # web UI that stays up (auto-restarts if it exits)
+
 python demo.py                 # terminal version, no extra deps (plays via afplay)
 ```
 
