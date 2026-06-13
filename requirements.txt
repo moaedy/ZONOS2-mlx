@@ -1,0 +1,9 @@
+# ZONOS2-mlx dependencies (Apple Silicon)
+mlx>=0.25                       # Apple's array framework — runs the language model
+torch>=2.6                      # only for the DAC vocoder + speaker encoder (run once)
+torchaudio                      # speaker-encoder mel front-end
+numpy
+soundfile                       # WAV/MP3 I/O
+descript-audio-codec==1.0.0     # 44.1 kHz DAC vocoder
+transformers>=4.56              # voice-cloning speaker encoder (ECAPA-TDNN)
+huggingface_hub                 # checkpoint download
