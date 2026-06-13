@@ -49,6 +49,14 @@ def is_moe_layer(i): return MOE_START <= i and (N_LAYERS - i) > MOE_END
 def layer_topk(i): return SPECIAL_TOPK.get(i, 1)
 
 
+def context_budget(prompt_len, requested=None, margin=8):
+    """Frames we can still generate after the prompt without overflowing the
+    model context (and our preallocated KV / RoPE caches). Matches the reference
+    server, which defaults max_tokens to the full max_seq_len."""
+    budget = max(1, MAX_SEQLEN - int(prompt_len) - margin)
+    return budget if requested is None else min(int(requested), budget)
+
+
 # ---- Prompt construction (numpy) -------------------------------------------
 def quality_token_id(feature_idx, bucket):
     base = TEXT_VOCAB - SPEAKING_RATE_BUCKETS - sum(QUALITY_COUNTS) - BACKGROUND_BUCKETS - ACCURATE_BUCKETS
@@ -385,7 +393,7 @@ class Zonos2MLX:
         logits = lin(h, self.multi_output).reshape(h.shape[0], N_CODEBOOKS, AUDIO_VOCAB)
         return LOSS_SOFTCAP * mx.tanh(logits / LOSS_SOFTCAP)
 
-    def generate(self, text, voice_emb=None, max_tokens=1024, temperature=1.15, topk=106,
+    def generate(self, text, voice_emb=None, max_tokens=None, temperature=1.15, topk=106,
                  min_p=0.18, rep_window=50, rep_penalty=1.2, rep_codebooks=8, seed=42, verbose=True):
         rng = np.random.default_rng(seed)
         self.cache_len = 0
@@ -394,6 +402,10 @@ class Zonos2MLX:
         spk_pos = 0 if voice_emb is not None else None
 
         P = prompt.shape[0]
+        # Like the reference server: generate up to the model's context window
+        # (max_seq_len). Cap to whatever room is left after the prompt so the
+        # preallocated KV / RoPE caches never overflow.
+        max_tokens = context_budget(P, max_tokens)
         t0 = time.time()
         logits = self.forward(prompt, np.arange(P), True, spk_emb, spk_pos)[-1]
         mx.eval(logits)
@@ -449,7 +461,7 @@ class Zonos2MLX:
 
     def generate_stream(self, text, on_chunk, voice_emb=None, temperature=1.15, topk=106,
                         min_p=0.18, rep_window=50, rep_penalty=1.2, rep_codebooks=8, seed=42,
-                        max_tokens=1500, chunk_frames=40, dac_device="mps"):
+                        max_tokens=None, chunk_frames=40, dac_device="mps"):
         """Generate and decode incrementally, calling on_chunk(sr, samples) with
         new audio as it becomes available - so playback can start immediately.
 
@@ -464,6 +476,7 @@ class Zonos2MLX:
         spk_emb = mx.array(voice_emb.astype(np.float32)) if voice_emb is not None else None
         spk_pos = 0 if voice_emb is not None else None
         P = prompt.shape[0]
+        max_tokens = context_budget(P, max_tokens)
         logits = self.forward(prompt, np.arange(P), True, spk_emb, spk_pos)[-1]
         mx.eval(logits)
 
@@ -540,7 +553,8 @@ def main():
     ap.add_argument("--text", default="Hello from Zonos 2, running on Apple Silicon with M.L.X.")
     ap.add_argument("--voice", default=None)
     ap.add_argument("--out", default="output_mlx.wav")
-    ap.add_argument("--max-tokens", type=int, default=900)
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="Frame cap; default = model context window (~71 s)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--temperature", type=float, default=1.15)
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])

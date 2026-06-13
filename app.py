@@ -61,7 +61,7 @@ class MLXWorker:
                 try:
                     frames, eos = self._tts.generate(
                         text, voice_emb=emb, temperature=temperature,
-                        seed=seed, max_tokens=1500, verbose=False)
+                        seed=seed, verbose=False)   # max_tokens defaults to context budget
                     audio, sr = X.decode_to_audio(frames, eos, device=self.dac_device)
                     done.result = None if audio is None else (sr, np.asarray(audio, np.float32))
                 except Exception as exc:        # surface to the UI thread
@@ -73,7 +73,7 @@ class MLXWorker:
                     self._tts.generate_stream(
                         text, on_chunk=lambda sr, d: out_q.put((sr, d)),
                         voice_emb=emb, temperature=temperature, seed=seed,
-                        max_tokens=1500, dac_device=self.dac_device)
+                        dac_device=self.dac_device)   # max_tokens -> context budget
                 except Exception as exc:
                     out_q.put(exc)
                 out_q.put(None)        # sentinel: stream finished
