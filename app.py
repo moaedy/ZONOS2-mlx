@@ -55,26 +55,49 @@ class MLXWorker:
         self._tts = X.Zonos2MLX(ckpt, dtype=dtype, quantize=quantize)
         self._ready.set()
         while True:
-            job = self._jobs.get()
-            text, emb, temperature, seed, done = job
-            try:
-                frames, eos = self._tts.generate(
-                    text, voice_emb=emb, temperature=temperature,
-                    seed=seed, max_tokens=1500, verbose=False)
-                audio, sr = X.decode_to_audio(frames, eos, device=self.dac_device)
-                done.result = None if audio is None else (sr, np.asarray(audio, np.float32))
-            except Exception as exc:        # surface to the UI thread
-                done.error = exc
-            done.set()
+            kind, *rest = self._jobs.get()
+            if kind == "full":
+                text, emb, temperature, seed, done = rest
+                try:
+                    frames, eos = self._tts.generate(
+                        text, voice_emb=emb, temperature=temperature,
+                        seed=seed, max_tokens=1500, verbose=False)
+                    audio, sr = X.decode_to_audio(frames, eos, device=self.dac_device)
+                    done.result = None if audio is None else (sr, np.asarray(audio, np.float32))
+                except Exception as exc:        # surface to the UI thread
+                    done.error = exc
+                done.set()
+            elif kind == "stream":
+                text, emb, temperature, seed, out_q = rest
+                try:
+                    self._tts.generate_stream(
+                        text, on_chunk=lambda sr, d: out_q.put((sr, d)),
+                        voice_emb=emb, temperature=temperature, seed=seed,
+                        max_tokens=1500, dac_device=self.dac_device)
+                except Exception as exc:
+                    out_q.put(exc)
+                out_q.put(None)        # sentinel: stream finished
 
     def generate(self, text, emb, temperature, seed):
         done = threading.Event()
         done.result = done.error = None
-        self._jobs.put((text, emb, temperature, seed, done))
+        self._jobs.put(("full", text, emb, temperature, seed, done))
         done.wait()
         if done.error is not None:
             raise done.error
         return done.result
+
+    def generate_stream(self, text, emb, temperature, seed):
+        """Yield (sr, samples) audio chunks as they are produced on the worker."""
+        out_q: queue.Queue = queue.Queue()
+        self._jobs.put(("stream", text, emb, temperature, seed, out_q))
+        while True:
+            item = out_q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
 
 def main():
@@ -96,16 +119,27 @@ def main():
     voices = discover_voices(args.voices_dir)
     print(f"Ready. Voices: {', '.join(voices)}", flush=True)
 
+    def _embedding(voice_name):
+        path = voices.get(voice_name)
+        return X.get_speaker_embedding(path, args.speaker_device) if path else None
+
     def synth(text, voice_name, temperature, seed):
         text = (text or "").strip()
         if not text:
             raise gr.Error("Please enter some text.")
-        path = voices.get(voice_name)
-        emb = X.get_speaker_embedding(path, args.speaker_device) if path else None
-        result = worker.generate(text, emb, float(temperature), int(seed))
+        result = worker.generate(text, _embedding(voice_name), float(temperature), int(seed))
         if result is None:
             raise gr.Error("No audio was generated; try different text.")
         return result
+
+    def synth_stream(text, voice_name, temperature, seed):
+        """Generator: plays audio while it is still being generated."""
+        text = (text or "").strip()
+        if not text:
+            raise gr.Error("Please enter some text.")
+        emb = _embedding(voice_name)
+        for sr, delta in worker.generate_stream(text, emb, float(temperature), int(seed)):
+            yield (sr, (np.clip(delta, -1.0, 1.0) * 32767).astype(np.int16))
 
     with gr.Blocks(title="ZONOS2-mlx") as demo:
         gr.Markdown(
@@ -123,13 +157,20 @@ def main():
                     choices=list(voices), value=list(voices)[0], label="Voice")
                 temperature = gr.Slider(0.5, 1.5, value=1.15, step=0.05, label="Temperature")
                 seed = gr.Number(value=42, label="Seed", precision=0)
-        btn = gr.Button("Generate", variant="primary")
-        out = gr.Audio(label="Output", autoplay=True)
+        with gr.Row():
+            btn = gr.Button("Generate", variant="primary")
+            stream_btn = gr.Button("Stream ▶  (play while generating)")
+        out = gr.Audio(label="Output (full clip)", autoplay=True)
+        stream_out = gr.Audio(
+            label="Streaming output (starts playing within ~1 s)",
+            streaming=True, autoplay=True)
         btn.click(synth, [text, voice, temperature, seed], out)
         text.submit(synth, [text, voice, temperature, seed], out)
+        stream_btn.click(synth_stream, [text, voice, temperature, seed], stream_out)
         gr.Markdown(
-            "_Tip: spell out numbers (\"twenty twenty six\") - text normalization isn't ported yet. "
-            "Cloning a brand-new voice loads the speaker encoder once, then caches it._")
+            "_**Generate** returns the whole clip; **Stream** plays it as it is produced "
+            "(the model runs at ~real time, so audio starts almost immediately). "
+            "Tip: spell out numbers (\"twenty twenty six\") - text normalization isn't ported yet._")
 
     demo.queue(default_concurrency_limit=1).launch(share=args.share, inbrowser=True)
 

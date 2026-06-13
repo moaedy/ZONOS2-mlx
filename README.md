@@ -104,7 +104,12 @@ python app.py --quantize 4     # same, in ~6 GB
 python demo.py                 # terminal version, no extra deps (plays via afplay)
 ```
 
-`app.py` opens a local Gradio page with a text box, a **voice dropdown** populated from `default_voices/`, temperature/seed controls, and an autoplaying audio player. The model loads once and stays resident, so every generation after the first is fast. `demo.py` is a zero-dependency terminal loop (`:voice` to switch voice, `:quit` to exit).
+`app.py` opens a local Gradio page with a text box, a **voice dropdown** populated from `default_voices/`, temperature/seed controls, and two buttons:
+
+- **Generate** - returns the whole clip.
+- **Stream ▶** - plays the audio **as it is generated**. Because decode runs at ~real time, sound starts in about **1.4 s** and then keeps pace with playback. (Implemented by decoding the codebook frames incrementally as they come out of the autoregressive loop.)
+
+The model loads once and stays resident, so every generation after the first is fast. `demo.py` is a zero-dependency terminal loop (`:voice` to switch voice, `:quit` to exit). Drop any `.wav`/`.mp3` into `default_voices/` and it appears in the dropdown as a clonable voice.
 
 ## Usage (CLI)
 

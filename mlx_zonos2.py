@@ -430,6 +430,66 @@ class Zonos2MLX:
         g = -np.log(-np.log(np.clip(rng.random(probs.shape), 1e-12, 1.0)))
         return (np.log(np.clip(probs, 1e-12, None)) + g).argmax(-1).tolist()
 
+    def generate_stream(self, text, on_chunk, voice_emb=None, temperature=1.15, topk=106,
+                        min_p=0.18, rep_window=50, rep_penalty=1.2, rep_codebooks=8, seed=42,
+                        max_tokens=1500, chunk_frames=40, dac_device="mps"):
+        """Generate and decode incrementally, calling on_chunk(sr, samples) with
+        new audio as it becomes available - so playback can start immediately.
+
+        The codebook delay means output frame N needs N..N+8 generated, so we can
+        decode up to len(frames)-8 at any point. We re-decode the prefix each flush
+        (cheap for demo lengths) and emit only the new tail, holding back one frame
+        at chunk boundaries to avoid DAC edge artifacts."""
+        import torch
+        rng = np.random.default_rng(seed)
+        self.cache_len = 0
+        prompt = build_prompt(text, with_speaker=voice_emb is not None)
+        spk_emb = mx.array(voice_emb.astype(np.float32)) if voice_emb is not None else None
+        spk_pos = 0 if voice_emb is not None else None
+        P = prompt.shape[0]
+        logits = self.forward(prompt, np.arange(P), True, spk_emb, spk_pos)[-1]
+        mx.eval(logits)
+
+        frames, eos_frame, eos_cd, cur, emitted = [], None, 0, P, 0
+
+        def flush(final):
+            nonlocal emitted
+            usable = len(frames) if final else len(frames) - (N_CODEBOOKS - 1)
+            if eos_frame is not None:
+                usable = min(usable, eos_frame)
+            if usable <= 0:
+                return
+            codes = shear_up_np(np.array(frames, dtype=np.int64), AUDIO_PAD_ID)[:usable]
+            c = torch.from_numpy(np.clip(codes, None, CODEBOOK_SIZE - 1)).to(dac_device)
+            c = c.unsqueeze(0).permute(0, 2, 1)
+            m = _get_dac(dac_device)
+            with torch.no_grad():
+                z = m.quantizer.from_codes(c)[0]
+                audio = m.decode(z).float().squeeze(1).squeeze(0).cpu().numpy()
+            end = len(audio) if final else max(emitted, len(audio) - 512)  # hold back ~1 frame
+            if end > emitted:
+                on_chunk(44100, audio[emitted:end].astype(np.float32))
+                emitted = end
+
+        for step in range(max_tokens):
+            tok = self._sample(np.array(logits.astype(mx.float32)), frames, temperature, topk,
+                               min_p, rep_window, rep_penalty, rep_codebooks, rng)
+            frames.append(tok)
+            if eos_frame is None and any(t == EOA_ID for t in tok):
+                eos_frame = max(0, step - max(c for c, t in enumerate(tok) if t == EOA_ID))
+                eos_cd = N_CODEBOOKS + 1
+            if eos_frame is not None:
+                eos_cd -= 1
+                if eos_cd <= 0:
+                    break
+            logits = self.forward(np.array([tok + [TEXT_VOCAB]], dtype=np.int64),
+                                  np.array([cur]), False)[-1]
+            mx.eval(logits)
+            cur += 1
+            if (step + 1) % chunk_frames == 0:
+                flush(False)
+        flush(True)
+
 
 # ---- Vocoder (PyTorch DAC) -------------------------------------------------
 _DAC = {}
