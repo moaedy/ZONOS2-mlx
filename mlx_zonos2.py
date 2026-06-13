@@ -133,9 +133,28 @@ def get_speaker_embedding(voice_path, device="cpu"):
 
 
 # ---- MLX helpers -----------------------------------------------------------
+# A weight is either a plain (out, in) array, or a quantized tuple
+# (wq, scales, biases, group_size, bits) produced by mx.quantize.
 def lin(x, w, b=None):
-    y = mx.matmul(x, w.swapaxes(-1, -2))
+    if isinstance(w, tuple):
+        wq, s, bz, gs, bits = w
+        y = mx.quantized_matmul(x, wq, s, bz, transpose=True, group_size=gs, bits=bits)
+    else:
+        y = mx.matmul(x, w.swapaxes(-1, -2))
     return y + b if b is not None else y
+
+
+def gmm(x, w, inds):
+    """Grouped MoE matmul: quantized (gather_qmm) or plain (gather_mm)."""
+    if isinstance(w, tuple):
+        wq, s, bz, gs, bits = w
+        return mx.gather_qmm(x, wq, s, bz, rhs_indices=inds, transpose=True, group_size=gs, bits=bits)
+    return mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=inds)
+
+
+def _weight_arrays(w):
+    """Underlying mx.arrays of a (possibly quantized) weight, for mx.eval."""
+    return list(w[:3]) if isinstance(w, tuple) else ([w] if isinstance(w, mx.array) else [])
 
 
 def rmsnorm(x, weight, eps):
@@ -152,11 +171,30 @@ def gelu(x): return 0.5 * x * (1.0 + mx.erf(x / math.sqrt(2.0)))
 
 # ---- Model -----------------------------------------------------------------
 class Zonos2MLX:
-    def __init__(self, ckpt_path, dtype=mx.bfloat16):
+    def __init__(self, ckpt_path, dtype=mx.bfloat16, quantize=None, q_group=64, scheme=None):
         import torch
         self.dtype = dtype
+        # Per-weight-kind bit-width. Attention (QK-norm + temperature) and the
+        # codebook output head are precision-sensitive; the 16x-redundant MoE
+        # experts tolerate low-bit better. "4-bit" is a tuned mixed scheme.
+        if scheme is not None:
+            self.scheme = scheme
+        elif quantize is None:
+            self.scheme = {}
+        elif quantize == 8:
+            self.scheme = {"attn": 8, "out": 8, "expert": 8, "dense": 8}
+        else:  # 4
+            # Only the 16x-redundant MoE experts go to 4-bit, and they need finer
+            # groups (group-64 collapses; group-32 is near-lossless). Attention,
+            # the output head and the few early dense FFNs stay at lossless 8-bit
+            # (the dense layers are early, so their quant error compounds).
+            self.scheme = {"attn": 8, "out": 8, "expert": 4, "dense": 8}
+            if q_group == 64:
+                q_group = 32
+        self.q_group = q_group
         t0 = time.time()
-        print(f"[load] reading {ckpt_path} (dtype={dtype}) ...", flush=True)
+        qstr = f", {quantize}-bit scheme {self.scheme}" if quantize else ""
+        print(f"[load] reading {ckpt_path} (dtype={dtype}{qstr}) ...", flush=True)
         sd = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=False)
         if "model" in sd and isinstance(sd["model"], dict):
             sd = sd["model"]
@@ -167,9 +205,18 @@ class Zonos2MLX:
         def g(key, dt=dtype):
             return to_mx(sd[key], dt)
 
+        def Q(arr, kind):
+            # Quantize a big linear/expert weight per the scheme. The router,
+            # norms, gater, temp, biases and embeddings always stay bf16.
+            bits = self.scheme.get(kind)
+            if not bits:
+                return arr
+            wq, s, b = mx.quantize(arr.astype(mx.float32), group_size=q_group, bits=bits)
+            return (wq, s, b, q_group, bits)
+
         self.embed = [g(f"multi_embedder.embedders.{i}.weight") for i in range(N_CODEBOOKS + 1)]
         self.out_norm = g("out_norm.weight")
-        self.multi_output = g("multi_output.weight")
+        self.multi_output = Q(g("multi_output.weight"), "out")
         self.spk_lda_w = g("speaker_lda_projection.weight", mx.float32)
         self.spk_lda_b = g("speaker_lda_projection.bias", mx.float32)
         self.spk_w = g("speaker_projection.weight", mx.float32)
@@ -181,9 +228,9 @@ class Zonos2MLX:
             L = {
                 "attn_norm": g(p + "attention_norm.weight"),
                 "ffn_norm": g(p + "ffn_norm.weight"),
-                "wq": g(p + "attention.wq.weight"),
-                "wkv": to_mx(sd[p + "attention.wkv.weight"].reshape(2 * N_KV_HEADS * HEAD_DIM, DIM)),
-                "wo": g(p + "attention.wo.weight"),
+                "wq": Q(g(p + "attention.wq.weight"), "attn"),
+                "wkv": Q(to_mx(sd[p + "attention.wkv.weight"].reshape(2 * N_KV_HEADS * HEAD_DIM, DIM)), "attn"),
+                "wo": Q(g(p + "attention.wo.weight"), "attn"),
                 "gater": g(p + "attention.gater.weight"),
                 "temp": g(p + "attention.temp", mx.float32).abs().reshape(N_HEADS, 1),
                 "is_moe": is_moe_layer(i),
@@ -192,8 +239,8 @@ class Zonos2MLX:
                 import torch as _t
                 w13 = sd[p + "feed_forward.experts.w13"]
                 gate_up = _t.cat([w13[:, 0::2, :], w13[:, 1::2, :]], dim=1).contiguous()
-                L["gate_up"] = to_mx(gate_up)
-                L["down"] = g(p + "feed_forward.experts.w2")
+                L["gate_up"] = Q(to_mx(gate_up), "expert")
+                L["down"] = Q(g(p + "feed_forward.experts.w2"), "expert")
                 L["r_down_w"] = g(p + "feed_forward.router.down_proj.weight")
                 L["r_down_b"] = g(p + "feed_forward.router.down_proj.bias")
                 L["r_norm"] = g(p + "feed_forward.router.rmsnorm_eda.weight")
@@ -208,10 +255,10 @@ class Zonos2MLX:
                 L["rss"] = g(rss_key) if rss_key in sd else None
                 L["topk"] = layer_topk(i)
             else:
-                L["w_in"] = to_mx(sd[p + "feed_forward.w_in.weight"].reshape(2 * INTERMEDIATE, DIM))
-                L["w_out"] = g(p + "feed_forward.w_out.weight")
+                L["w_in"] = Q(to_mx(sd[p + "feed_forward.w_in.weight"].reshape(2 * INTERMEDIATE, DIM)), "dense")
+                L["w_out"] = Q(g(p + "feed_forward.w_out.weight"), "dense")
             self.layers.append(L)
-            mx.eval([v for v in L.values() if isinstance(v, mx.array)])
+            mx.eval([a for v in L.values() for a in _weight_arrays(v)])
 
         inv = 1.0 / (ROPE_THETA ** (np.arange(0, HEAD_DIM, 2) / HEAD_DIM))
         freqs = np.outer(np.arange(MAX_SEQLEN), inv)
@@ -220,7 +267,7 @@ class Zonos2MLX:
         self.k_buf = [mx.zeros((MAX_SEQLEN, N_KV_HEADS, HEAD_DIM), dtype=dtype) for _ in range(N_LAYERS)]
         self.v_buf = [mx.zeros((MAX_SEQLEN, N_KV_HEADS, HEAD_DIM), dtype=dtype) for _ in range(N_LAYERS)]
         self.cache_len = 0
-        mx.eval(self.cos, self.sin, *self.embed, self.multi_output)
+        mx.eval(self.cos, self.sin, *self.embed, *_weight_arrays(self.multi_output))
         del sd
         print(f"[load] done in {time.time()-t0:.1f}s on {mx.default_device()}", flush=True)
 
@@ -280,12 +327,12 @@ class Zonos2MLX:
         inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]     # (T, k) chosen experts
         weight = mx.take_along_axis(prob, inds, axis=-1).astype(x.dtype)  # (T, k) — no renorm
 
-        # Fused grouped MoE via mx.gather_mm (the idiomatic MLX MoE primitive):
-        # picks each token's expert weights by index without materializing them.
+        # Fused grouped MoE (gather_mm / quantized gather_qmm): picks each token's
+        # expert weights by index without materializing them.
         xe = mx.expand_dims(x, (-2, -3))                             # (T,1,1,dim)
-        gu = mx.gather_mm(xe, L["gate_up"].swapaxes(-1, -2), rhs_indices=inds)  # (T,k,1,2*inter)
+        gu = gmm(xe, L["gate_up"], inds)                             # (T,k,1,2*inter)
         act = silu(gu[..., :INTERMEDIATE]) * gu[..., INTERMEDIATE:]
-        y = mx.gather_mm(act, L["down"].swapaxes(-1, -2), rhs_indices=inds)     # (T,k,1,dim)
+        y = gmm(act, L["down"], inds)                               # (T,k,1,dim)
         out = (y.squeeze(-2) * weight[..., None]).sum(axis=-2)       # (T, dim)
         return out, router_states_next
 
@@ -410,17 +457,21 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--temperature", type=float, default=1.15)
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    ap.add_argument("--quantize", default="none", choices=["none", "4", "8"],
+                    help="Quantize the big weights to 4/8-bit (cuts memory ~4x at 4-bit)")
+    ap.add_argument("--q-group", type=int, default=64, help="Quantization group size")
     ap.add_argument("--speaker-device", default="cpu")
     ap.add_argument("--dac-device", default="mps")
     ap.add_argument("--ckpt", default=None)
     args = ap.parse_args()
 
     dtype = {"bf16": mx.bfloat16, "fp16": mx.float16, "fp32": mx.float32}[args.dtype]
+    quantize = None if args.quantize == "none" else int(args.quantize)
     ckpt = args.ckpt or glob.glob(os.path.expanduser(
         "~/.cache/huggingface/hub/models--Zyphra--ZONOS2/snapshots/*/model.pth"))[0]
 
     voice_emb = get_speaker_embedding(args.voice, args.speaker_device) if args.voice else None
-    tts = Zonos2MLX(ckpt, dtype=dtype)
+    tts = Zonos2MLX(ckpt, dtype=dtype, quantize=quantize, q_group=args.q_group)
     print(f"[gen] text: {args.text!r}  voice: {args.voice or '(default)'}", flush=True)
     frames, eos_frame = tts.generate(args.text, voice_emb=voice_emb, max_tokens=args.max_tokens,
                                      temperature=args.temperature, seed=args.seed)

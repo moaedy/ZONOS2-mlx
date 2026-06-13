@@ -21,6 +21,16 @@ This project reimplements the entire model in **pure MLX**, Apple's array framew
 
 A 5-second clip is generated in about 5 seconds. The audio frame rate of the DAC codec is 44100 / 512 = **86.1 frames per second**, so ~85-93 frames/s of generation is **real time**.
 
+With **4-bit quantization** (`--quantize 4`) it gets faster *and* smaller, with no audible quality loss:
+
+| 4-bit (`--quantize 4`) | value |
+|---|---|
+| Decode speed | **~100 frames/s** (above real time) |
+| Resident memory | **~6 GB** (vs ~15 GB bf16) |
+| Quality vs bf16 | prefill logit cosine **0.9996** |
+
+This makes the ~8B model comfortable on **16 GB** Macs. See [Quantization](#quantization) below.
+
 **Correctness is verified, not assumed.** The MLX forward pass is checked against the PyTorch reference port on identical inputs:
 
 ```
@@ -105,9 +115,28 @@ Useful flags:
 | `--seed` | `42` | Reproducibility |
 | `--temperature` | `1.15` | Sampling temperature |
 | `--max-tokens` | `900` | ~10.5 s of audio cap |
+| `--quantize` | `none` | `4` or `8` to quantize the weights (see below) |
 | `--speaker-device` | `cpu` | Device for the one-shot speaker encoder |
 
 Example outputs are in [`samples/`](samples/).
+
+## Quantization
+
+```bash
+python mlx_zonos2.py --text "..." --quantize 4 --out out.wav   # ~6 GB, ~100 frames/s
+python mlx_zonos2.py --text "..." --quantize 8 --out out.wav   # ~7.5 GB, lossless
+```
+
+MLX makes weight quantization a one-liner (`mx.quantize`) with fused low-bit kernels (`mx.quantized_matmul` for the linears, **`mx.gather_qmm`** for the MoE experts - the quantized sibling of `gather_mm`). But naive 4-bit-everything collapses this model, so `--quantize 4` uses a **tuned mixed scheme**, arrived at empirically by measuring prefill-logit cosine against the bf16 reference:
+
+| Weights | Precision | Why |
+|---|---|---|
+| MoE experts (the bulk, ~7 B params) | **4-bit, group 32** | 16x-redundant; tolerates 4-bit *if* groups are small (group-64 collapses to cosine 0.84, group-32 holds at **0.9997**) |
+| Attention (`wq/wkv/wo`) | 8-bit | QK-norm + learned temperature make attention precision-sensitive |
+| Output head + early dense FFNs | 8-bit | codebook logits are sensitive; dense layers are early, so their error compounds |
+| Router, norms, gater, embeddings | bf16 | tiny, and routing accuracy is critical |
+
+Result: **~6 GB resident, ~100 frames/s, prefill logit cosine 0.9996 vs bf16** - no audible quality loss, and it fits a 16 GB Mac. `--quantize 8` is bit-for-bit lossless (cosine 1.000) at ~7.5 GB.
 
 ## Limitations
 - **No text normalization yet.** The official model uses NeMo TN to verbalize numbers/dates; this port sends raw text bytes, so spell out numbers (`"twenty twenty six"`, not `"2026"`) for best results.
@@ -115,8 +144,9 @@ Example outputs are in [`samples/`](samples/).
 - The speaker encoder loads a ~1.7 B model the first time you clone a new voice (then caches the embedding).
 
 ## Roadmap
-- **4-bit quantization** via `mx.quantize` + `mx.gather_qmm` - cuts memory from ~15 GB to ~4-5 GB and pushes decode further past real time.
+- ~~4-bit quantization~~ - **done** (see [Quantization](#quantization)): ~6 GB, ~100 frames/s, near-lossless.
 - NeMo-equivalent text normalization.
+- Streaming output and request batching.
 
 ## Credits & license
 - Model weights and architecture: **[Zyphra/ZONOS2](https://huggingface.co/Zyphra/ZONOS2)** ([repo](https://github.com/Zyphra/ZONOS2)). This project loads the official checkpoint and reimplements inference; it does not redistribute the weights.
